@@ -18,7 +18,10 @@ let queue: any[] = [];
 let currentJob: any = null;
 let isProcessing = false;
 
-// ── ฟังก์ชัน download แยกออกมา เรียก background ──────────────────────────
+// ── [NEW] Song list & Delete queue ──────────────────────────────────────
+let songList: string[] = [];          // ESP32 push มาเก็บตรงนี้
+let deleteQueue: string[] = [];       // รายการที่รอให้ ESP32 ลบ
+
 function processNextJob() {
     if (isProcessing || currentJob) return;
 
@@ -55,10 +58,8 @@ function processNextJob() {
 
         if (files.length === 0) { job.status = "error"; currentJob = null; return; }
 
-        // ✅ รอให้ OS flush ไฟล์ก่อน
         await new Promise(r => setTimeout(r, 2000));
 
-        // ✅ ตรวจว่าไฟล์มีขนาดสมเหตุสมผล (> 100KB)
         const filePath = path.join(DOWNLOAD_DIR, files[0].name);
         const size = fs.statSync(filePath).size;
         if (size < 100_000) {
@@ -75,32 +76,26 @@ function processNextJob() {
     });
 }
 
-// ── 1. Frontend ส่ง URL ──────────────────────────────────────────────────
+// ── Download endpoints (เดิม) ────────────────────────────────────────────
 app.post("/submit", (req, res) => {
     const { url } = req.body;
     if (!url) return res.status(400).json({ error: "no url" });
 
     queue.push({ url, status: "pending" });
     console.log(`[QUEUE] Added: ${url}`);
-
-    // เริ่ม download ทันทีถ้าว่างอยู่
     processNextJob();
-
     res.json({ ok: true });
 });
 
-// ── 2. ESP32 trigger (แค่ kick processNextJob) ───────────────────────────
 app.get("/esp/next", (req, res) => {
-    processNextJob();  // เรียกได้เสมอ ไม่มีผลถ้ากำลัง download อยู่แล้ว
+    processNextJob();
     res.json({ ok: true });
 });
 
-// ── 3. ESP32 เช็คสถานะ ───────────────────────────────────────────────────
 app.get("/esp/status", (req, res) => {
     if (!currentJob || currentJob.status !== "done") {
         return res.json({ pending: false });
     }
-
     res.json({
         pending: true,
         url: currentJob.fileUrl,
@@ -108,19 +103,73 @@ app.get("/esp/status", (req, res) => {
     });
 });
 
-// ── 4. ESP32 ACK ─────────────────────────────────────────────────────────
 app.post("/esp/ack", (req, res) => {
     const { filename } = req.body;
-
     if (!currentJob) return res.json({ ok: false });
 
     if (currentJob.file === filename) {
         console.log(`[ACK] Done: ${filename}`);
         currentJob = null;
-        // เริ่ม job ถัดไปทันที
         processNextJob();
     } else {
         console.log(`[ACK] Mismatch: got=${filename} expected=${currentJob.file}`);
+    }
+    res.json({ ok: true });
+});
+
+// ── [NEW] ESP32 push รายการเพลงบน SD card ───────────────────────────────
+// ESP32 เรียกหลัง sdcard_load_songs() ทุกครั้ง
+// Body: { "songs": ["song1.mp3", "song2.mp3", ...] }
+app.post("/esp/songs", (req, res) => {
+    const { songs } = req.body;
+    if (!Array.isArray(songs)) return res.status(400).json({ error: "songs must be array" });
+
+    songList = songs;
+    console.log(`[SONGS] Updated: ${songs.length} songs`);
+    res.json({ ok: true });
+});
+
+// ── [NEW] Frontend ดูรายการเพลงบน SD card ───────────────────────────────
+app.get("/esp/songs", (req, res) => {
+    res.json({ songs: songList });
+});
+
+// ── [NEW] Frontend สั่งลบเพลง ────────────────────────────────────────────
+// Body: { "filename": "song.mp3" }
+app.post("/esp/delete", (req, res) => {
+    const { filename } = req.body;
+    if (!filename) return res.status(400).json({ error: "no filename" });
+
+    if (!deleteQueue.includes(filename)) {
+        deleteQueue.push(filename);
+        console.log(`[DELETE] Queued: ${filename}`);
+    }
+    res.json({ ok: true, queued: filename });
+});
+
+// ── [NEW] ESP32 poll — เช็คว่ามีอะไรต้องลบไหม ───────────────────────────
+app.get("/esp/delete-queue", (req, res) => {
+    if (deleteQueue.length === 0) {
+        return res.json({ pending: false });
+    }
+    const filename = deleteQueue[0]; // ส่งทีละไฟล์
+    res.json({ pending: true, filename });
+});
+
+// ── [NEW] ESP32 แจ้งว่าลบเสร็จแล้ว ──────────────────────────────────────
+// Body: { "filename": "song.mp3", "success": true }
+app.post("/esp/delete-ack", (req, res) => {
+    const { filename, success } = req.body;
+
+    const idx = deleteQueue.indexOf(filename);
+    if (idx !== -1) {
+        deleteQueue.splice(idx, 1);
+        console.log(`[DELETE-ACK] ${filename} — success=${success}`);
+    }
+
+    // อัปเดต songList ให้ตรงกับ SD จริง
+    if (success) {
+        songList = songList.filter(s => s !== filename);
     }
 
     res.json({ ok: true });
